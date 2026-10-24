@@ -1,18 +1,101 @@
+const APP_VERSION = '2.2.0';
+
+// 文件名后缀 -> Content-Type 映射表
+// 说明：ALLOWED_EXTENSIONS 直接由本表的 key 派生，因此「加一处」即可同时生效于
+//       1) 上传白名单校验（handleUploadRequest，非白名单返回 415）
+//       2) 文件下载时的 Content-Type（handleImageRequest -> getContentType）
+// 新增格式只需在对应分类下加一行，务必确认后缀不会落到「可执行 / 可渲染脚本」类：
+// 严禁加入 html / htm / js / mjs / css / xml / json / wasm / php 等，
+// 否则会被同源托管为脚本，造成存储型 XSS。
+// 注：svg 虽在表内，但 handleImageRequest 会强制 Content-Disposition: attachment
+//     + 严格 CSP，不会被浏览器内联渲染。
 const CONTENT_TYPE_MAP = {
-  'jpg': 'image/jpeg',
+  // ── 图片 ────────────────────────────────────────────────
+  'jpg':  'image/jpeg',
   'jpeg': 'image/jpeg',
-  'png': 'image/png',
-  'gif': 'image/gif',
+  'png':  'image/png',
+  'gif':  'image/gif',
   'webp': 'image/webp',
-  'bmp': 'image/bmp',
-  'svg': 'image/svg+xml',
-  'mp4': 'video/mp4',
-  'avi': 'video/x-msvideo',
-  'mov': 'video/quicktime',
-  'webm': 'video/webm'
+  'bmp':  'image/bmp',
+  'tif':  'image/tiff',
+  'tiff': 'image/tiff',
+  'ico':  'image/vnd.microsoft.icon',
+  'avif': 'image/avif',
+  'heic': 'image/heic',
+  'heif': 'image/heif',
+  'svg':  'image/svg+xml',
+
+  // ── 视频 ────────────────────────────────────────────────
+  'mp4':  'video/mp4',
+  'm4v':  'video/x-m4v',
+  'webm': 'video/webm',
+  'ogv':  'video/ogg',
+  'avi':  'video/x-msvideo',
+  'mov':  'video/quicktime',
+  'mkv':  'video/x-matroska',
+  'flv':  'video/x-flv',
+  'wmv':  'video/x-ms-wmv',
+  'mpg':  'video/mpeg',
+  'mpeg': 'video/mpeg',
+  '3gp':  'video/3gpp',
+  'ts':   'video/mp2t',
+
+  // ── 音频 ────────────────────────────────────────────────
+  'mp3':  'audio/mpeg',
+  'm4a':  'audio/mp4',
+  'aac':  'audio/aac',
+  'wav':  'audio/wav',
+  'flac': 'audio/flac',
+  'ogg':  'audio/ogg',
+  'oga':  'audio/ogg',
+  'opus': 'audio/ogg',
+  'wma':  'audio/x-ms-wma',
+  'aiff': 'audio/aiff',
+
+  // ── 压缩包 / 归档 ───────────────────────────────────────
+  'zip':  'application/zip',
+  'rar':  'application/vnd.rar',
+  '7z':   'application/x-7z-compressed',
+  'tar':  'application/x-tar',
+  'gz':   'application/gzip',
+  'tgz':  'application/gzip',
+  'bz2':  'application/x-bzip2',
+  'xz':   'application/x-xz',
+
+  // ── 文档 ────────────────────────────────────────────────
+  // 安全性：这一类 MIME 都不是 HTML/JS，配合全局的
+  // X-Content-Type-Options: nosniff，浏览器不会把它们当脚本执行，
+  // 因此以 inline 直接打开是安全的（txt 会按纯文本渲染，不会解析标签）。
+  'pdf':  'application/pdf',
+  'txt':  'text/plain; charset=utf-8',
+  'md':   'text/markdown; charset=utf-8',
+  'csv':  'text/csv; charset=utf-8',
+  'doc':  'application/msword',
+  'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'xls':  'application/vnd.ms-excel',
+  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'ppt':  'application/vnd.ms-powerpoint',
+  'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'epub': 'application/epub+zip',
+  'rtf':  'application/rtf'
 };
 
 const ALLOWED_EXTENSIONS = new Set(Object.keys(CONTENT_TYPE_MAP));
+
+// 强制以附件形式下载、禁止浏览器内联渲染的后缀（handleImageRequest 里生效）
+// svg 必须在此列：它是 XML，内联会执行脚本，是存储型 XSS 的高危入口。
+// 若你担心 PDF 内嵌脚本，把 'pdf' 加进来即可，代价是浏览器不再内联预览。
+const ATTACHMENT_EXTENSIONS = new Set(['svg']);
+
+// 管理页缩略图渲染用的分类白名单（只影响后台预览效果，不影响上传/下载）
+// 逻辑：命中图片分支 -> <img>；命中视频分支 -> <video>；其余显示 📁 图标
+// 注：svg 故意不放进图片分支 —— 它被强制以 attachment 下载，内联预览必然裂图
+const PREVIEW_IMAGE_EXTENSIONS = new Set([
+  'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'ico', 'avif', 'heic', 'heif'
+]);
+const PREVIEW_VIDEO_EXTENSIONS = new Set([
+  'mp4', 'm4v', 'webm', 'ogv', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'mpg', 'mpeg', '3gp', 'ts'
+]);
 
 const CACHE_CONFIG = {
   HTML: 3600,
@@ -93,6 +176,29 @@ function authenticate(request, username, password) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 把任意形态（完整 URL / 路径 / 裸 key）规整成裸 key
+function toBareKey(value) {
+  if (!value) return '';
+  const s = String(value);
+  const slash = s.lastIndexOf('/');
+  return slash >= 0 ? s.slice(slash + 1) : s;
+}
+
+// 拼接对外访问的完整 URL（域名永远来自配置）
+function buildFileUrl(domain, bareKey) {
+  return `https://${domain}/${bareKey}`;
+}
+
+// 查询候选值（按优先级）：
+//   1. 裸 key              —— 新上传的记录（以及已在 D1 控制台改写过的老记录）
+//   2. DOMAIN 拼的完整 URL   —— 历史遗留记录，且域名与当前配置一致
+//   3. 请求域名拼的完整 URL   —— 历史遗留记录，正用旧域名 / workers.dev 访问
+// 三者去重后一次 IN 查询搞定，仍然走主键索引，不产生全表扫描。
+function buildLookupCandidates(bareKey, canonicalUrl, requestOriginUrl) {
+  const list = [bareKey, canonicalUrl, requestOriginUrl];
+  return list.filter((v, i) => v && list.indexOf(v) === i);
 }
 
 export default {
@@ -399,6 +505,20 @@ async function handleRootRequest(request, config) {
   .project-link a { color: #667eea; text-decoration: none; transition: color 0.3s ease; }
   .project-link a:hover { color: #764ba2; text-decoration: underline; }
 
+  .version-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #667eea;
+    background: rgba(102, 126, 234, 0.12);
+    border: 1px solid rgba(102, 126, 234, 0.25);
+    vertical-align: middle;
+    user-select: all;
+  }
+
   .toast-container {
     position: fixed;
     top: 20px;
@@ -498,6 +618,7 @@ async function handleRootRequest(request, config) {
     <p class="project-link">
       项目开源于 GitHub -
       <a href="https://github.com/0-RTT/telegraph" target="_blank" rel="noopener noreferrer">0-RTT/telegraph</a>
+      <span class="version-badge" title="当前部署版本">v${escapeHtml(APP_VERSION)}</span>
     </p>
   </div>
 
@@ -989,33 +1110,63 @@ async function handleAdminRequest(request, config) {
     return unauthorizedResponse();
   }
   const url = new URL(request.url);
-  const page = parseInt(url.searchParams.get('page') || '1', 10);
-  return await generateAdminPage(config.database, page);
+  // ── 游标分页参数 ──
+  // cursor: 上一页最后（或下一页最前）一条记录的 url 原值，用作锚点
+  // dir:    'next' 向下翻（url < cursor），'prev' 向上翻（url > cursor 后反转）
+  // 第一页不带 cursor。相比 OFFSET，翻到任意深度都只读 pageSize 行。
+  const cursor = url.searchParams.get('cursor') || '';
+  const dir = url.searchParams.get('dir') === 'prev' ? 'prev' : 'next';
+  return await generateAdminPage(config, cursor, dir);
 }
 
-async function generateAdminPage(DATABASE, page = 1) {
-  const pageSize = 50;
-  const offset = (page - 1) * pageSize;
-  const totalCount = await DATABASE.prepare('SELECT COUNT(*) as count FROM media').first();
-  const totalPages = Math.ceil(totalCount.count / pageSize);
-  const mediaData = await fetchMediaData(DATABASE, pageSize, offset);
+// 总数缓存：百万级表每次 COUNT(*) 都是一次近全表索引扫描（1M 行 ≈ 1M rows read）。
+// D1 免费计划读取额度 500 万行/日，管理页每翻一页就扫一次非常浪费。
+// 这里按 isolate 做 60 秒级缓存，误差可接受；isolate 回收后自动重建。
+let totalCountCache = { value: 0, ts: 0 };
+const TOTAL_COUNT_TTL_MS = 60 * 1000;
 
-  const mediaHtml = mediaData.map(({ url }) => {
-    const fileExtension = getFileExtension(url);
-    const fileName = url.split('/').pop();
-    const dotIdx = fileName.lastIndexOf('.');
-    const baseName = dotIdx > 0 ? fileName.slice(0, dotIdx) : fileName;
+async function getTotalCount(DATABASE) {
+  const now = Date.now();
+  if (totalCountCache.ts && now - totalCountCache.ts < TOTAL_COUNT_TTL_MS) {
+    return totalCountCache.value;
+  }
+  const row = await DATABASE.prepare('SELECT COUNT(*) as count FROM media').first();
+  totalCountCache = { value: row ? row.count : 0, ts: now };
+  return totalCountCache.value;
+}
+
+async function generateAdminPage(config, cursor = '', dir = 'next') {
+  const DATABASE = config.database;
+  const pageSize = 50;
+  const totalCount = { count: await getTotalCount(DATABASE) };
+  // 取回的 url 可能是裸 key（新上传），也可能是完整 URL（历史遗留）；
+  // 统一规整成裸 key 后再按当前 DOMAIN 拼展示链接，两种形态都能正常显示。
+  // 多取 1 行用来判断「是否还有下一页」，避免额外发一次 COUNT 查询。
+  const { rows, hasNext, hasPrev } = await fetchMediaPage(DATABASE, pageSize, cursor, dir);
+  const mediaData = rows;
+  // 下一页锚点 = 本页最后一条；上一页锚点 = 本页第一条。
+  // 不做 encodeURIComponent —— 交给 URLSearchParams.set() 统一编码，避免二次编码。
+  const nextCursor = mediaData.length ? mediaData[mediaData.length - 1].url : '';
+  const prevCursor = mediaData.length ? mediaData[0].url : '';
+
+  const mediaHtml = mediaData.map((row) => {
+    const bareKey = toBareKey(row.url);
+    const url = buildFileUrl(config.domain, bareKey);   // 展示/复制/删除用
+    const fileExtension = getFileExtension(bareKey);
+    const dotIdx = bareKey.lastIndexOf('.');
+    const baseName = dotIdx > 0 ? bareKey.slice(0, dotIdx) : bareKey;
     const timestamp = parseInt(baseName, 10);
     const timeText = Number.isFinite(timestamp) && timestamp > 0
       ? new Date(timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
       : '未知';
     const mediaType = escapeHtml(fileExtension);
     const escapedUrl = escapeHtml(url);
-    const supportedImageExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff'];
-    const supportedVideoExtensions = ['mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm'];
-    const isImage = supportedImageExtensions.includes(fileExtension);
-    const isVideo = supportedVideoExtensions.includes(fileExtension);
+    // 用顶部统一定义的集合判断，避免与上传白名单不同步
+    const isImage = PREVIEW_IMAGE_EXTENSIONS.has(fileExtension);
+    const isVideo = PREVIEW_VIDEO_EXTENSIONS.has(fileExtension);
     const isSupported = isImage || isVideo;
+    // <source type> 必须是 MIME，不能拿后缀拼（否则 video/mkv 这类非法值浏览器不播）
+    const mediaTypeAttr = escapeHtml(getContentType(fileExtension));
     const backgroundStyle = isSupported ? '' : `style="font-size: 50px; display: flex; justify-content: center; align-items: center;"`;
     const icon = isSupported ? '' : '📁';
     return `
@@ -1024,7 +1175,7 @@ async function generateAdminPage(DATABASE, page = 1) {
       <div class="media-type">${mediaType}</div>
       ${isVideo ? `
         <video class="gallery-video" preload="none" controls>
-          <source data-src="${escapedUrl}" type="video/${escapeHtml(fileExtension)}">
+          <source data-src="${escapedUrl}" type="${mediaTypeAttr}">
           您的浏览器不支持视频标签。
         </video>
       ` : `
@@ -1077,6 +1228,7 @@ async function generateAdminPage(DATABASE, page = 1) {
       .pagination .page-info { color: #555; font-weight: 500; padding: 0 15px; }
       .empty-state { text-align: center; padding: 80px 20px; color: #999; font-size: 18px; background: rgba(255, 255, 255, 0.6); border-radius: 16px; backdrop-filter: blur(8px); }
       .empty-state i { font-size: 72px; margin-bottom: 20px; display: block; opacity: 0.4; }
+      .version-badge { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 12px; color: #667eea; background: rgba(102, 126, 234, 0.12); border: 1px solid rgba(102, 126, 234, 0.25); vertical-align: middle; }
       @media (max-width: 768px) {
         body { padding: 15px; }
         .page-title { font-size: 24px; margin-bottom: 15px; }
@@ -1279,6 +1431,7 @@ async function generateAdminPage(DATABASE, page = 1) {
       <div class="header-left">
         <span>媒体文件 ${totalCount.count} 个</span>
         <span>已选中: <span id="selected-count">0</span>个</span>
+        <span class="version-badge" title="当前部署版本">v${escapeHtml(APP_VERSION)}</span>
       </div>
       <div class="header-right hidden">
         <div class="dropdown">
@@ -1297,19 +1450,31 @@ async function generateAdminPage(DATABASE, page = 1) {
       ${mediaData.length === 0 ? '<div class="empty-state"><i>📁</i><div>暂无媒体文件</div></div>' : mediaHtml}
     </div>
     ${mediaData.length > 0 ? `
+    <!-- 游标分页：多取 1 行判断是否有下一页，不再需要 totalPages / OFFSET -->
     <div class="pagination">
-      <button onclick="goToPage(${page - 1})" ${page <= 1 ? 'disabled' : ''}>上一页</button>
-      <span class="page-info">第 ${page} / ${totalPages} 页 (共 ${totalCount.count} 个)</span>
-      <button onclick="goToPage(${page + 1})" ${page >= totalPages ? 'disabled' : ''}>下一页</button>
+      <button onclick="goPrev()" ${hasPrev ? '' : 'disabled'}>上一页</button>
+      <span class="page-info">本页 ${mediaData.length} 个 · 共 ${totalCount.count} 个</span>
+      <button onclick="goNext()" ${hasNext ? '' : 'disabled'}>下一页</button>
+      <button onclick="goFirst()">回到最新</button>
     </div>
     ` : ''}
-    <div class="footer">到底啦</div>
+    <div class="footer">${mediaData.length > 0 && !hasNext ? '到底啦' : ''}</div>
     <script>
-      function goToPage(pageNum) {
+      // 游标分页导航：锚点是本页首/末条记录的 url，服务端做索引范围扫描
+      function goCursor(cursor, dir) {
         const url = new URL(window.location.href);
-        url.searchParams.set('page', pageNum);
+        if (cursor) {
+          url.searchParams.set('cursor', cursor);
+          url.searchParams.set('dir', dir);
+        } else {
+          url.searchParams.delete('cursor');
+          url.searchParams.delete('dir');
+        }
         window.location.href = url.toString();
       }
+      function goPrev()  { goCursor(${JSON.stringify(prevCursor)}, 'prev'); }
+      function goNext()  { goCursor(${JSON.stringify(nextCursor)}, 'next'); }
+      function goFirst() { goCursor('', 'next'); }
     </script>
   </body>
   </html>
@@ -1317,11 +1482,54 @@ async function generateAdminPage(DATABASE, page = 1) {
   return new Response(html, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
-async function fetchMediaData(DATABASE, limit = null, offset = 0) {
-  let query = 'SELECT url FROM media ORDER BY url DESC';
-  if (limit !== null) query += ` LIMIT ${limit} OFFSET ${offset}`;
-  const result = await DATABASE.prepare(query).all();
-  return result.results.map(row => ({ url: row.url }));
+// ════════════════════════════════════════════════════════════════════
+// 游标分页（替代 OFFSET 分页）
+// ────────────────────────────────────────────────────────────────────
+// 为什么改：OFFSET n 要「读取并丢弃」前 n 行，翻到第 1 万页就要扫 50 万行，
+//           既慢又疯狂消耗 D1 rows read（免费计划 500 万行/日，翻几页就没了）。
+//           游标分页每页恒定只读 pageSize(+1) 行，翻到多深都一样快。
+// 原理：url 是主键（有索引），WHERE url < ? / > ? 是索引范围扫描，
+//       SQLite 直接定位到锚点，不扫描被跳过的行。
+// 双向：next 走 DESC，prev 走 ASC 取回后在内存反转 —— 两个方向都用得上索引。
+// 每页多取 1 行判断 hasNext，省掉一次额外查询。
+// ════════════════════════════════════════════════════════════════════
+async function fetchMediaPage(DATABASE, pageSize, cursor, dir) {
+  const take = pageSize + 1;
+
+  let result;
+  if (!cursor) {
+    // 第一页
+    result = await DATABASE.prepare(
+      'SELECT url FROM media ORDER BY url DESC LIMIT ?'
+    ).bind(take).all();
+  } else if (dir === 'prev') {
+    // 向上翻：取锚点「之后」的行（ASC），再反转成正常倒序
+    result = await DATABASE.prepare(
+      'SELECT url FROM media WHERE url > ? ORDER BY url ASC LIMIT ?'
+    ).bind(cursor, take).all();
+  } else {
+    // 向下翻：取锚点「之前」的行（DESC）
+    result = await DATABASE.prepare(
+      'SELECT url FROM media WHERE url < ? ORDER BY url DESC LIMIT ?'
+    ).bind(cursor, take).all();
+  }
+
+  const raw = (result.results || []).map(row => ({ url: row.url }));
+
+  if (dir === 'prev') {
+    // ASC 取回顺序是 [紧邻锚点的, ...更远的]，多取的那一页在末尾：
+    // 先裁掉末尾（更远的），再反转成倒序，剩下的就是「锚点之前紧邻的一页」。
+    const hasPrev = raw.length > pageSize;      // 上面还有内容 → 上一页可点
+    if (hasPrev) raw.pop();
+    raw.reverse();
+    // 从下往上翻回来的这一页，其下方必然还有内容（就是刚离开的那一页）
+    return { rows: raw.slice(0, pageSize), hasNext: true, hasPrev };
+  }
+
+  const hasNext = raw.length > pageSize;
+  if (hasNext) raw.pop();
+  // 带游标进来说明上方存在数据；没游标就是第一页
+  return { rows: raw, hasNext, hasPrev: !!cursor };
 }
 
 async function handleUploadRequest(request, config) {
@@ -1382,13 +1590,13 @@ async function handleUploadRequest(request, config) {
 
     const timestamp = Date.now();
     const r2Key = `${timestamp}-${crypto.randomUUID().slice(0, 8)}`;
-    const imageURL = `https://${config.domain}/${r2Key}.${ext}`;
+    const imageKey = `${r2Key}.${ext}`;
 
     await config.database.prepare(
       'INSERT INTO media (url, fileId) VALUES (?, ?) ON CONFLICT(url) DO NOTHING'
-    ).bind(imageURL, fileId).run();
+    ).bind(imageKey, fileId).run();
 
-    return jsonResponse({ data: imageURL });
+    return jsonResponse({ data: buildFileUrl(config.domain, imageKey) });
   } catch (error) {
     console.error('上传失败:', error);
     return jsonResponse({ error: error.message }, 500);
@@ -1399,17 +1607,24 @@ async function handleImageRequest(request, config) {
   const url = new URL(request.url);
   const pathname = url.pathname;
   const ext = getFileExtension(pathname);
+  const bareKey = toBareKey(pathname);
+  const canonicalUrl = buildFileUrl(config.domain, bareKey);
 
   const cache = caches.default;
-  const cacheKey = new Request(`${url.origin}${pathname}`);
+  const cacheKey = new Request(canonicalUrl);   // 缓存键规范化，各域名共用一份缓存
 
   const cached = await cache.match(cacheKey);
   if (cached) return cached;
 
-  const requestedUrl = `${url.origin}${pathname}`;
+  const candidates = buildLookupCandidates(
+    bareKey,
+    canonicalUrl,
+    `${url.origin}/${bareKey}`
+  );
+  const placeholders = candidates.map(() => '?').join(',');
   const result = await config.database.prepare(
-    'SELECT fileId FROM media WHERE url = ?'
-  ).bind(requestedUrl).first();
+    `SELECT fileId FROM media WHERE url IN (${placeholders}) LIMIT 1`
+  ).bind(...candidates).first();
 
   if (!result) {
     return new Response('资源不存在', { status: 404 });
@@ -1454,7 +1669,7 @@ async function handleImageRequest(request, config) {
   headers.set('Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}, immutable`);
   headers.set('CDN-Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}`);
 
-  if (ext === 'svg') {
+  if (ATTACHMENT_EXTENSIONS.has(ext)) {
     headers.set('Content-Disposition', 'attachment');
     headers.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data:");
   } else {
@@ -1508,22 +1723,35 @@ async function handleDeleteImagesRequest(request, config) {
       return jsonResponse({ message: '没有要删除的项' }, 400);
     }
 
+    // 入参既接受完整 URL（管理页复制的就是它），也接受裸 key。
+    // 统一规整成裸 key，同时保留原始完整 URL 作为候选 —— 新旧两种形态都能删掉。
     const expectedPrefix = `https://${config.domain}/`;
-    const invalid = keysToDelete.find(u => typeof u !== 'string' || !u.startsWith(expectedPrefix));
+    const invalid = keysToDelete.find(u => {
+      if (typeof u !== 'string' || !u) return true;
+      return !u.startsWith(expectedPrefix) && !/^[0-9a-zA-Z._-]+$/.test(u);
+    });
     if (invalid) {
       return jsonResponse({ error: '非法的 URL: ' + invalid }, 400);
     }
 
-    const placeholders = keysToDelete.map(() => '?').join(',');
+    const rawKeys = keysToDelete.map(u => ({ bare: toBareKey(u), full: buildFileUrl(config.domain, toBareKey(u)) }));
+    const delCandidates = [];
+    rawKeys.forEach(({ bare, full }) => {
+      if (bare) delCandidates.push(bare);
+      if (full !== bare) delCandidates.push(full);
+    });
+    const uniqueCandidates = delCandidates.filter((v, i) => delCandidates.indexOf(v) === i);
+
+    const placeholders = uniqueCandidates.map(() => '?').join(',');
     const cache = caches.default;
 
     const [dbResult] = await Promise.all([
       config.database
         .prepare(`DELETE FROM media WHERE url IN (${placeholders})`)
-        .bind(...keysToDelete)
+        .bind(...uniqueCandidates)
         .run(),
-      Promise.all(keysToDelete.map(async (url) => {
-        await cache.delete(new Request(url));
+      Promise.all(rawKeys.map(async ({ full }) => {
+        await cache.delete(new Request(full));
       }))
     ]);
 

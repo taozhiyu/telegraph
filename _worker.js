@@ -177,8 +177,12 @@ function authenticate(request, username, password) {
   const authHeader = request.headers.get('Authorization');
   if (!authHeader || !authHeader.startsWith('Basic ')) return false;
   try {
-    const credentials = atob(authHeader.slice(6)).split(':');
-    return credentials[0] === username && credentials[1] === password;
+    const decoded = atob(authHeader.slice(6));
+    const separator = decoded.indexOf(':');
+    if (separator < 0) return false;
+    const suppliedUsername = decoded.slice(0, separator);
+    const suppliedPassword = decoded.slice(separator + 1);
+    return suppliedUsername === username && suppliedPassword === password;
   } catch {
     return false;
   }
@@ -1664,8 +1668,11 @@ async function handleImageRequest(request, config) {
   const cache = caches.default;
   const cacheKey = new Request(canonicalUrl);   // 缓存键规范化，各域名共用一份缓存
 
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
+  // A cached full response cannot satisfy Range semantics; bypass it for byte-range requests.
+  if (!request.headers.has('Range')) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
 
   const candidates = buildLookupCandidates(
     bareKey,

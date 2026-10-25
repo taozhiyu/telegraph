@@ -3,7 +3,8 @@
 基于 Cloudflare Worker 和 Telegram Bot API 的图床 / 视频床 / 文件床服务
 
 > 本仓库 fork 自 [0-RTT/telegraph](https://github.com/0-RTT/telegraph)（上游基线：2026-09-13），
-> 在此之上做了独立维护与增强。所有改动均向后兼容，可无缝替换上游 `_worker.js`。
+> 在此之上做了独立维护与增强。
+> **升级注意：v2.3.0 更改了默认认证行为，不属于完全无缝的行为兼容升级。** 部署前请配置强 `USERNAME` / `PASSWORD`；只有显式设置 `DISABLE_AUTH=true` 才会关闭首页与上传认证。跨域名使用的历史完整 URL 记录，也需按下文说明迁移。
 > 当前版本：**v2.3.0**（页面底部与管理页头部会显示版本号徽章）
 
 ---

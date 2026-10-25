@@ -206,8 +206,11 @@ function isSafeWriteRequest(request, expectedContentType) {
     }
   }
 
-  const contentType = (request.headers.get('Content-Type') || '').toLowerCase();
-  return contentType.startsWith(expectedContentType);
+  const contentType = (request.headers.get('Content-Type') || '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+  return contentType === expectedContentType;
 }
 
 function sleep(ms) {

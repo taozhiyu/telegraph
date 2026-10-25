@@ -1,4 +1,4 @@
-const APP_VERSION = '2.2.0';
+const APP_VERSION = '2.3.0';
 
 // 文件名后缀 -> Content-Type 映射表
 // 说明：ALLOWED_EXTENSIONS 直接由本表的 key 派生，因此「加一处」即可同时生效于
@@ -84,8 +84,8 @@ const ALLOWED_EXTENSIONS = new Set(Object.keys(CONTENT_TYPE_MAP));
 
 // 强制以附件形式下载、禁止浏览器内联渲染的后缀（handleImageRequest 里生效）
 // svg 必须在此列：它是 XML，内联会执行脚本，是存储型 XSS 的高危入口。
-// 若你担心 PDF 内嵌脚本，把 'pdf' 加进来即可，代价是浏览器不再内联预览。
-const ATTACHMENT_EXTENSIONS = new Set(['svg']);
+// PDF 同样强制附件下载，避免在图床同源上下文中内联渲染文档内容。
+const ATTACHMENT_EXTENSIONS = new Set(['svg', 'pdf']);
 
 // 管理页缩略图渲染用的分类白名单（只影响后台预览效果，不影响上传/下载）
 // 逻辑：命中图片分支 -> <img>；命中视频分支 -> <video>；其余显示 📁 图标
@@ -104,16 +104,26 @@ const CACHE_CONFIG = {
 };
 
 function extractConfig(env) {
+  // 防护默认开启；只有明确设置 DISABLE_AUTH=true 才允许匿名访问首页/上传。
+  // 非法大小配置回退到安全默认值，避免 NaN 使文件大小比较失效。
+  const rawMaxSizeMb = env.MAX_SIZE_MB;
+  const parsedMaxSizeMb = rawMaxSizeMb == null || rawMaxSizeMb === ''
+    ? 20
+    : Number(rawMaxSizeMb);
+  const maxSizeMb = Number.isSafeInteger(parsedMaxSizeMb) && parsedMaxSizeMb > 0
+    ? parsedMaxSizeMb
+    : 20;
+
   return {
     domain: env.DOMAIN,
     database: env.DATABASE,
     username: env.USERNAME,
     password: env.PASSWORD,
     adminPath: env.ADMIN_PATH || 'admin',
-    enableAuth: env.ENABLE_AUTH === 'true',
+    disableAuth: env.DISABLE_AUTH === 'true',
     tgBotToken: env.TG_BOT_TOKEN,
     tgChatId: env.TG_CHAT_ID,
-    maxSize: (env.MAX_SIZE_MB ? parseInt(env.MAX_SIZE_MB, 10) : 20) * 1024 * 1024
+    maxSize: maxSizeMb * 1024 * 1024
   };
 }
 
@@ -174,6 +184,28 @@ function authenticate(request, username, password) {
   }
 }
 
+// 防止通过浏览器跨站触发带有 Basic Auth 凭据的写操作。
+// Origin 存在时必须与请求的精确 origin 一致；浏览器的跨站/同站跨源标记会被拒绝。
+// 不带这些浏览器头的 CLI/API 客户端仍可调用接口，但必须遵循对应认证规则。
+function isSafeWriteRequest(request, expectedContentType) {
+  const fetchSite = (request.headers.get('Sec-Fetch-Site') || '').toLowerCase();
+  if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
+    return false;
+  }
+
+  const origin = request.headers.get('Origin');
+  if (origin) {
+    try {
+      if (new URL(origin).origin !== new URL(request.url).origin) return false;
+    } catch {
+      return false;
+    }
+  }
+
+  const contentType = (request.headers.get('Content-Type') || '').toLowerCase();
+  return contentType.startsWith(expectedContentType);
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -192,10 +224,10 @@ function buildFileUrl(domain, bareKey) {
 }
 
 // 查询候选值（按优先级）：
-//   1. 裸 key              —— 新上传的记录（以及已在 D1 控制台改写过的老记录）
-//   2. DOMAIN 拼的完整 URL   —— 历史遗留记录，且域名与当前配置一致
-//   3. 请求域名拼的完整 URL   —— 历史遗留记录，正用旧域名 / workers.dev 访问
-// 三者去重后一次 IN 查询搞定，仍然走主键索引，不产生全表扫描。
+//   1. 裸 key              —— 新上传记录或已迁移的历史记录
+//   2. DOMAIN 拼的完整 URL   —— 未迁移历史记录，且旧域名与当前配置一致
+//   3. 请求域名拼的完整 URL   —— 未迁移历史记录，且请求主机就是其旧域名
+// 切换到全新域名时，无法通过索引自动推导任意旧主机名；须先按 README 迁移。
 function buildLookupCandidates(bareKey, canonicalUrl, requestOriginUrl) {
   const list = [bareKey, canonicalUrl, requestOriginUrl];
   return list.filter((v, i) => v && list.indexOf(v) === i);
@@ -232,7 +264,7 @@ export default {
 };
 
 async function handleRootRequest(request, config) {
-  if (config.enableAuth && !authenticate(request, config.username, config.password)) {
+  if (!config.disableAuth && !authenticate(request, config.username, config.password)) {
     return unauthorizedResponse();
   }
 
@@ -1533,8 +1565,27 @@ async function fetchMediaPage(DATABASE, pageSize, cursor, dir) {
 }
 
 async function handleUploadRequest(request, config) {
-  if (config.enableAuth && !authenticate(request, config.username, config.password)) {
+  if (!config.disableAuth && !authenticate(request, config.username, config.password)) {
     return unauthorizedResponse();
+  }
+  if (!isSafeWriteRequest(request, 'multipart/form-data')) {
+    return jsonResponse({ error: '跨站请求被拒绝或请求类型无效' }, 403);
+  }
+
+  // 在解析 multipart 之前先拒绝明显超限的请求体。Content-Length 只是提前拦截；
+  // 解析完成后仍以 File.size 做最终校验。给 multipart 元数据预留 1 MiB。
+  const contentLengthHeader = request.headers.get('Content-Length');
+  if (contentLengthHeader !== null) {
+    if (!/^[0-9]+$/.test(contentLengthHeader)) {
+      return jsonResponse({ error: '无效的 Content-Length' }, 400);
+    }
+    const contentLength = Number(contentLengthHeader);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+      return jsonResponse({ error: '无效的 Content-Length' }, 400);
+    }
+    if (contentLength > config.maxSize + 1024 * 1024) {
+      return jsonResponse({ error: `请求体超过${config.maxSize / (1024 * 1024)}MB 文件限制及 multipart 开销上限` }, 413);
+    }
   }
 
   try {
@@ -1555,13 +1606,8 @@ async function handleUploadRequest(request, config) {
 
     const uploadFormData = new FormData();
     uploadFormData.append('chat_id', config.tgChatId);
-    if (file.type.startsWith('image/gif')) {
-      const newFileName = file.name.replace(/\.gif$/i, '.jpeg');
-      const newFile = new File([file], newFileName, { type: 'image/jpeg' });
-      uploadFormData.append('document', newFile);
-    } else {
-      uploadFormData.append('document', file);
-    }
+    // 文件内容没有进行转码，必须保留原始文件名与 MIME 类型（尤其是 GIF）。
+    uploadFormData.append('document', file);
 
     let telegramResponse;
     try {
@@ -1606,8 +1652,13 @@ async function handleUploadRequest(request, config) {
 async function handleImageRequest(request, config) {
   const url = new URL(request.url);
   const pathname = url.pathname;
+  // Media keys are single path segments. Reject "/" and nested/trailing-slash paths
+  // before cache.match(), otherwise an empty key could collide with the cached homepage.
+  const bareKey = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+  if (!bareKey || bareKey.includes('/') || !/^[0-9A-Za-z._-]+$/.test(bareKey)) {
+    return new Response('资源不存在', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+  }
   const ext = getFileExtension(pathname);
-  const bareKey = toBareKey(pathname);
   const canonicalUrl = buildFileUrl(config.domain, bareKey);
 
   const cache = caches.default;
@@ -1657,17 +1708,35 @@ async function handleImageRequest(request, config) {
   }
 
   const getFileResponse = `https://api.telegram.org/file/bot${config.tgBotToken}/${filePath}`;
-  const response = await fetch(getFileResponse);
+  const rangeHeader = request.headers.get('Range');
+  const upstreamRequest = rangeHeader
+    ? new Request(getFileResponse, { headers: { Range: rangeHeader } })
+    : new Request(getFileResponse);
+  const response = await fetch(upstreamRequest);
+
+  if (response.status === 416 && rangeHeader) {
+    const rangeHeaders = new Headers({
+      'Accept-Ranges': response.headers.get('Accept-Ranges') || 'bytes',
+      'Cache-Control': 'no-store'
+    });
+    const contentRange = response.headers.get('Content-Range');
+    if (contentRange) rangeHeaders.set('Content-Range', contentRange);
+    return new Response(null, { status: 416, headers: rangeHeaders });
+  }
   if (!response.ok) {
     return new Response('获取文件内容失败', { status: 502 });
   }
 
   const contentType = getContentType(ext);
-  const headers = new Headers(response.headers);
+  // Do not blindly forward Telegram's response headers. Preserve only headers needed
+  // for byte-range playback and ordinary representation metadata.
+  const headers = new Headers();
+  for (const name of ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Last-Modified', 'ETag']) {
+    const value = response.headers.get(name);
+    if (value) headers.set(name, value);
+  }
   headers.set('Content-Type', contentType);
   headers.set('X-Content-Type-Options', 'nosniff');
-  headers.set('Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}, immutable`);
-  headers.set('CDN-Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}`);
 
   if (ATTACHMENT_EXTENSIONS.has(ext)) {
     headers.set('Content-Disposition', 'attachment');
@@ -1676,11 +1745,21 @@ async function handleImageRequest(request, config) {
     headers.set('Content-Disposition', 'inline');
   }
 
+  // Partial responses must not enter the shared cache. If Telegram ignores Range and
+  // returns 200, pass through the complete body but still do not cache this Range request.
+  if (rangeHeader || response.status === 206) {
+    headers.set('Cache-Control', 'no-store');
+    headers.set('CDN-Cache-Control', 'no-store');
+    return new Response(response.body, { status: response.status, headers });
+  }
+
+  headers.set('Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}, immutable`);
+  headers.set('CDN-Cache-Control', `public, max-age=${CACHE_CONFIG.IMAGE}`);
   const responseToCache = new Response(response.body, {
-    status: 200,
+    status: response.status,
     headers
   });
-  await cache.put(cacheKey, responseToCache.clone());
+  if (response.status === 200) await cache.put(cacheKey, responseToCache.clone());
   return responseToCache;
 }
 
@@ -1716,25 +1795,49 @@ async function handleDeleteImagesRequest(request, config) {
   if (request.method !== 'POST') {
     return new Response('Method Not Allowed', { status: 405 });
   }
+  if (!isSafeWriteRequest(request, 'application/json')) {
+    return jsonResponse({ error: '跨站请求被拒绝或请求类型无效' }, 403);
+  }
+
+  const contentLengthHeader = request.headers.get('Content-Length');
+  if (contentLengthHeader !== null) {
+    if (!/^[0-9]+$/.test(contentLengthHeader)) {
+      return jsonResponse({ error: '无效的 Content-Length' }, 400);
+    }
+    const contentLength = Number(contentLengthHeader);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > 64 * 1024) {
+      return jsonResponse({ error: '删除请求体过大' }, 413);
+    }
+  }
 
   try {
     const keysToDelete = await request.json();
     if (!Array.isArray(keysToDelete) || keysToDelete.length === 0) {
       return jsonResponse({ message: '没有要删除的项' }, 400);
     }
+    if (keysToDelete.length > 100) {
+      return jsonResponse({ error: '单次请求最多处理 50 个不同文件' }, 413);
+    }
 
-    // 入参既接受完整 URL（管理页复制的就是它），也接受裸 key。
-    // 统一规整成裸 key，同时保留原始完整 URL 作为候选 —— 新旧两种形态都能删掉。
+    // 入参接受当前域名的完整 URL（管理页复制的就是它）或裸 key。
+    // 历史完整 URL 的跨域名迁移请按 README 的 D1 迁移步骤执行。
     const expectedPrefix = `https://${config.domain}/`;
     const invalid = keysToDelete.find(u => {
       if (typeof u !== 'string' || !u) return true;
-      return !u.startsWith(expectedPrefix) && !/^[0-9a-zA-Z._-]+$/.test(u);
+      if (/^[0-9a-zA-Z._-]+$/.test(u)) return false;
+      if (!u.startsWith(expectedPrefix)) return true;
+      const pathKey = u.slice(expectedPrefix.length);
+      return !pathKey || pathKey.includes('/') || !/^[0-9a-zA-Z._-]+$/.test(pathKey);
     });
     if (invalid) {
       return jsonResponse({ error: '非法的 URL: ' + invalid }, 400);
     }
 
-    const rawKeys = keysToDelete.map(u => ({ bare: toBareKey(u), full: buildFileUrl(config.domain, toBareKey(u)) }));
+    const uniqueInputs = [...new Set(keysToDelete)];
+    const rawKeys = uniqueInputs.map(u => ({ bare: toBareKey(u), full: buildFileUrl(config.domain, toBareKey(u)) }));
+    if (rawKeys.length > 50) {
+      return jsonResponse({ error: '单次请求最多删除 50 个不同文件' }, 413);
+    }
     const delCandidates = [];
     rawKeys.forEach(({ bare, full }) => {
       if (bare) delCandidates.push(bare);

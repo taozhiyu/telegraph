@@ -4,7 +4,7 @@
 
 > 本仓库 fork 自 [0-RTT/telegraph](https://github.com/0-RTT/telegraph)（上游基线：2026-09-13），
 > 在此之上做了独立维护与增强。所有改动均向后兼容，可无缝替换上游 `_worker.js`。
-> 当前版本：**v2.2.0**（页面底部与管理页头部会显示版本号徽章）
+> 当前版本：**v2.3.0**（页面底部与管理页头部会显示版本号徽章）
 
 ---
 
@@ -16,13 +16,12 @@
 一旦更换域名，查询字符串对不上，历史文件**全部 404**。本 Fork 的修复分两层：
 
 - **存储层**：新上传只存「裸 key」`1734567890123-a1b2c3d4.jpg`，域名不再入库。
-- **读取层**：查询时一次 `IN` 同时匹配三种形态 —— 裸 key / 当前域名完整 URL / 请求域名完整 URL。
-  因此**历史老数据无需任何改动就能正常访问**，换域名、用 `*.workers.dev` 访问都不会 404。
-- 缓存键统一为规范化 URL，多个入口共用一份缓存。
-- 删除接口同样做归一化，完整 URL 与裸 key 都能正确删除。
+- **读取层**：使用一次索引查询匹配裸 key、配置域名 URL、当前请求域名 URL。
+- **重要兼容边界**：未迁移的旧记录仍保存原主机名。只有旧主机名恰好等于配置域名或当前请求主机时才会命中；切换到全新域名前，必须按下方 SQL 将历史 URL 迁移成裸 key。
+- 缓存键统一为规范化 URL，避免不同入口对同一裸 key 使用不同缓存键。
+- 删除接口支持裸 key 和当前配置域名下的完整 URL；跨域名历史 URL 需要迁移后才能稳定删除。
 
-> 新旧两种形态**永久共存**，不存在「必须迁移」这回事。
-> 想统一数据形态的话见下方「数据形态统一（可选）」，在 D1 控制台跑几条 SQL 即可，项目里不内置迁移功能。
+> 该版本不再声称任意历史域名的完整 URL 可以永久免迁移共存。迁移仅需改 D1 中的 key，不重新上传 Telegram 文件，也不改变 fileId。
 
 ### 2. 上传格式白名单大幅扩充（47 → 61 项）
 
@@ -37,7 +36,7 @@
 | 文档 | pdf txt md csv doc docx xls xlsx ppt pptx epub rtf |
 
 - `ALLOWED_EXTENSIONS` 由同一张表派生，加一处即同时生效于上传校验与下载 `Content-Type`
-- `svg` 仍强制 `Content-Disposition: attachment` + 严格 CSP，杜绝存储型 XSS
+- `svg` 强制 `Content-Disposition: attachment` + 严格 CSP；`pdf` 同样强制附件下载，避免同源内联文档渲染
 - 严禁加入 `html / htm / js / mjs / css / xml / json / wasm / php`（源码注释中已标注）
 - 修复管理页 `<source type="video/mkv">` 这类非法 MIME（改为查映射表取真实 MIME）
 
@@ -75,7 +74,7 @@ SELECT url FROM media WHERE url  > ? ORDER BY url ASC  LIMIT 51
 ## 功能特点（继承自上游）
 
 ### 核心功能
-- 🔐 可选的访客验证功能（Basic Auth）
+- 🔐 默认启用访客验证（Basic Auth；仅 DISABLE_AUTH=true 关闭）
 - 🗜️ 可选的图片压缩功能（默认开启，支持前端切换）
 - 📦 可选的文件大小限制（默认 20MB，可通过环境变量配置）
 - 📁 支持图片、视频等常见媒体格式上传（白名单校验，防止存储型 XSS）
@@ -86,7 +85,7 @@ SELECT url FROM media WHERE url  > ? ORDER BY url ASC  LIMIT 51
 ### 管理功能
 - 📋 支持查看本地历史记录
 - 🖼️ 图库管理界面，支持批量操作
-- 🗑️ 支持批量删除文件（同步删除数据库记录和 CDN 缓存）
+- 🗑️ 支持批量删除索引（删除 D1 记录并尝试清理当前 Worker 缓存；不删除 Telegram 原始文件，也不能立即撤销全球/浏览器缓存）
 - ⏰ 显示文件上传时间
 - 📋 支持多种格式复制链接（URL、BBCode、Markdown）
 - 🧭 游标分页，百万级数据翻页不卡顿
@@ -107,7 +106,7 @@ SELECT url FROM media WHERE url  > ? ORDER BY url ASC  LIMIT 51
 - 🏷️ 版本号徽章
 
 ### 性能优化
-- ⚡ Cloudflare Cache API 缓存支持
+- ⚡ Cloudflare Cache API 缓存支持（仅缓存完整 200 响应；Range 请求透传且不写共享缓存）
 - 🎨 懒加载和骨架屏优化
 - 🌅 Bing 每日壁纸背景（自动轮播）
 - 🔁 获取文件路径自动重试（最多 3 次，带退避）
@@ -117,13 +116,13 @@ SELECT url FROM media WHERE url  > ? ORDER BY url ASC  LIMIT 51
 - 📡 基于 Telegram Bot API 的文件存储
 - 💾 使用 Cloudflare D1 数据库存储文件映射关系
 - 🎯 通过 fileId 实现文件访问
-- 🔗 url 以裸 key 形式存储，与域名解耦，新旧形态永久共存
+- 🔗 新上传的 url 以裸 key 形式存储；旧的完整 URL 记录需迁移后才能彻底解耦域名
 
 ---
 
 ## 部署
 
-> ⚠️ 虽然项目使用了 Worker 的缓存 API，但仍建议配置好 **边缘 TTL** 并开启 **访客验证**，防止被刷导致扣费。
+> ⚠️ 默认启用首页与上传接口的 Basic Auth 防护。只有设置 `DISABLE_AUTH=true` 才会关闭这两处防护；媒体文件 URL 仍为公开访问。删除操作只删除 D1 索引，不会删除 Telegram 频道中的原始消息，也无法强制清空全球边缘或浏览器缓存。
 
 ### 环境变量
 
@@ -138,10 +137,12 @@ SELECT url FROM media WHERE url  > ? ORDER BY url ASC  LIMIT 51
 | USERNAME | 管理员用户名 | 是 | - | admin |
 | PASSWORD | 管理员密码 | 是 | - | password123 |
 | ADMIN_PATH | 管理后台路径 | 是 | `admin` | admin |
-| ENABLE_AUTH | 访客验证（`true` 开启，不设置或 `false` 关闭） | 否 | 关闭 | false |
+| DISABLE_AUTH | 关闭首页与上传接口的 Basic Auth（仅严格等于 `true` 时关闭） | 否 | `false`（防护开启） | true |
 | MAX_SIZE_MB | 单文件最大支持大小（单位：MB） | 否 | 20 | 20 |
 
-> `ADMIN_PATH` 建议改成随机长串：管理后台是无条件 Basic Auth，路径本身即一层防护。
+> `USERNAME` 和 `PASSWORD` 必须配置为强凭据，否则默认保护的首页与上传接口会返回 401。管理后台和删除接口始终要求管理员认证。旧变量 `ENABLE_AUTH` 将被忽略；只有 `DISABLE_AUTH=true` 才关闭首页与上传接口的访客认证。媒体文件 URL 仍是公开的。
+>
+> `ADMIN_PATH` 建议改成随机长串，但它只能减少被扫描发现的概率，不能替代 Basic Auth。
 
 ### 绑定说明
 
@@ -167,88 +168,85 @@ CREATE TABLE media (
 
 ---
 
-## 数据形态统一（可选，在 D1 控制台执行）
+## 旧数据迁移（跨域名切换前必做）
 
-**先说结论：这一步完全可以不做的。** 读取侧三种形态都能匹配，换域名也已彻底修好，
-下面这些 SQL 纯粹是让库里的数据看起来更整齐。嫌麻烦直接跳过，不影响任何功能。
+新上传记录保存的是裸 key，例如 1734567890123-a1b2c3d4.jpg。旧版本记录则可能是完整 URL，例如 https://old.example.com/1734567890123.jpg。代码为避免每次读取都全表扫描，只会查询裸 key、当前配置域名 URL 和当前请求域名 URL；因此，切换到一个全新的主机名时，未迁移的旧记录可能无法访问或删除。
 
-### 为什么是 SQL 而不是内置功能
+迁移只修改 D1 的主键值，不会重新上传文件，也不会改变 Telegram 的 fileId。**先备份 D1，再执行以下步骤。**
 
-- 项目里曾经内置过迁移接口，后来移除了 —— 一次性的数据整理，不值得长期占着一个 HTTP 端点、一份环境变量和一套前端面板。
-- 在 D1 控制台执行**不消耗 Workers 请求数**，也不受免费计划 10 ms CPU 限制，比走 Worker 更省。
+### 1. 检查待迁移数据
 
-### 为什么必须分批、为什么是 1000 行
+    SELECT COUNT(*) AS legacy_count
+    FROM media
+    WHERE url LIKE 'http%://%/%';
 
-- **D1 单条 SQL 最长执行 30 秒**。Cloudflare 官方明确要求：影响百万行的 `UPDATE`/`DELETE` 必须分批，
-  建议每批 **1000 行以内**。一条 `UPDATE` 直接改 100 万行必然超时或被拒绝。
-- 每改 1 行 ≈ **2 rows written**（表行 1 次 + 主键索引 1 次）。D1 免费计划写入额度只有 **10 万/日**，
-  1000 行就占掉 2000 次。分批可以随时观察消耗、随时停手，不至于一次性把当天额度打满导致 D1 拒绝查询。
+    SELECT url
+    FROM media
+    WHERE url LIKE 'http%://%/%'
+    LIMIT 10;
 
-### 准备工作：先看一眼
+### 2. 检查迁移后可能发生的主键冲突
 
-```sql
--- 1. 还剩多少行是旧的完整 URL 形态
-SELECT COUNT(*) AS pending FROM media WHERE url >= 'http';
+以下查询应返回 **0 行**。若有结果，请先人工处理重复 key；不要直接执行 UPDATE，否则主键冲突会导致对应批次失败。
 
--- 2. 随机看几条，确认前缀长什么样
-SELECT url FROM media WHERE url >= 'http' LIMIT 5;
-```
+    -- 多条历史 URL 归一化后得到相同 key
+    WITH legacy AS (
+      SELECT url,
+             substr(
+               url,
+               instr(url, '://') + 3
+                 + instr(substr(url, instr(url, '://') + 3), '/')
+             ) AS bare_key
+      FROM media
+      WHERE url LIKE 'http%://%/%'
+    )
+    SELECT bare_key, COUNT(*) AS n
+    FROM legacy
+    GROUP BY bare_key
+    HAVING COUNT(*) > 1;
 
-> 这里用 `url >= 'http'` 而不是 `LIKE '%/%'`：裸 key 以数字开头（ASCII 里 `0`~`9` 都小于 `h`），
-> 所以这个范围条件能精确圈出「非裸 key」的行，并且**走主键索引**；
-> 而 `LIKE '%/%'` 用不上索引，每批都要全表扫一遍。
+    -- 历史 URL 归一化后会覆盖已经存在的裸 key
+    WITH legacy AS (
+      SELECT url,
+             substr(
+               url,
+               instr(url, '://') + 3
+                 + instr(substr(url, instr(url, '://') + 3), '/')
+             ) AS bare_key
+      FROM media
+      WHERE url LIKE 'http%://%/%'
+    )
+    SELECT legacy.url AS legacy_url, legacy.bare_key
+    FROM legacy
+    JOIN media AS existing ON existing.url = legacy.bare_key
+    WHERE existing.url <> legacy.url;
 
-### 执行：一次改 1000 行
+### 3. 分批迁移，每批最多 1000 行
 
-把 `https://旧域名/` 换成第 2 步看到的实际前缀，**反复执行下面这条，直到返回的影响行数为 0**：
+重复执行以下语句，直到影响行数为 0。更新后的 key 不再匹配完整 URL 条件，因此后续批次会继续处理剩余记录。
 
-```sql
-UPDATE media
-SET url = REPLACE(url, 'https://旧域名/', '')
-WHERE rowid IN (
-  SELECT rowid FROM media WHERE url >= 'http' LIMIT 1000
-);
-```
+    UPDATE media
+    SET url = substr(
+      url,
+      instr(url, '://') + 3
+        + instr(substr(url, instr(url, '://') + 3), '/')
+    )
+    WHERE rowid IN (
+      SELECT rowid
+      FROM media
+      WHERE url LIKE 'http%://%/%'
+      LIMIT 1000
+    );
 
-已实测验证：每条正好影响 1000 行，重复执行逐批推进（1000→999→…→0），
-已改过的行不会被重复匹配（`REPLACE` 后 url 不再 `>= 'http'`），可以放心多跑几次。
+### 4. 验证
 
-> **关于 `rowid IN (SELECT ...)`**：SQLite 的 `UPDATE` 默认不支持 `LIMIT`
-> （需要 `SQLITE_ENABLE_UPDATE_DELETE_LIMIT` 编译选项，D1 未开启），
-> 所以先用子查询圈出 1000 个 `rowid`，再按主键定位更新 —— 定位是 O(1)，语句也最简。
+    -- 应返回 0
+    SELECT COUNT(*) FROM media WHERE url LIKE 'http%://%/%';
 
-**不确定旧域名、或库里混杂了多个旧域名**，用这条通用写法（取最后一个 `/` 之后的内容，无需填域名）：
+    -- 行数应与迁移前一致
+    SELECT COUNT(*) FROM media;
 
-```sql
-UPDATE media
-SET url = replace(url, rtrim(url, replace(url, '/', '')), '')
-WHERE rowid IN (
-  SELECT rowid FROM media WHERE url LIKE 'https://%' LIMIT 1000
-);
-```
-
-### 收尾：验证
-
-```sql
--- 应为 0
-SELECT COUNT(*) FROM media WHERE url >= 'http';
-
--- 应等于迁移前的总数（一条都没丢）
-SELECT COUNT(*) FROM media;
-```
-
-### 注意事项
-
-- **先备份**：Cloudflare 后台 D1 → 你的数据库 → Export，或用
-  `npx wrangler d1 export <数据库名> --remote --output=backup.sql`
-- **`REPLACE` 的域名别填错**：填错时 `REPLACE` 匹配不到、值不变，但 `WHERE` 仍会命中，
-  表现为「每次都改 1000 行却永远改不完」。执行一次后跑一下上面的验证语句，确认 `pending` 在下降。
-- **同名冲突**：旧格式是纯时间戳，同毫秒同后缀才会撞主键，概率极低；真撞了会报 `UNIQUE constraint failed`，
-  该批整批回滚，手动给冲突行换个后缀再跑即可。
-- **百万行的性价比**：200 万 rows written 在免费计划下要跑 20 天，期间每天都撞额度上限。
-  真有百万行，要么干脆不迁，要么开一个月 Workers Paid（含 5000 万 rows written/月，200 万只占 4%，**不产生超额费用**）再迁，约 1–3 小时跑完。
-
----
+> 注意：迁移前先确认所有历史 URL 都是“主机名 + 单个文件 key”结构。遇到不符合此结构的自定义数据，应单独处理。迁移后，新旧主键将统一成裸 key，游标分页的字典序也能按时间戳前缀自然排列。
 
 ## 上传白名单说明
 
@@ -263,6 +261,15 @@ SELECT COUNT(*) FROM media;
 ## 更新日志
 
 ### 本 Fork
+
+#### v2.3.0
+- 默认开启首页与上传接口 Basic Auth 防护；仅 `DISABLE_AUTH=true` 可关闭，忽略旧 `ENABLE_AUTH`
+- 修复空文件 key 与根路径缓存键碰撞；拒绝嵌套/尾斜杠的非文件路径
+- 加入上传/删除写接口的来源与 Content-Type 校验，增加请求体及批量删除上限
+- 校验 `MAX_SIZE_MB`，无效配置回退 20 MB；上传前提前检查 Content-Length
+- 支持透传 Range 请求；不缓存 206/Range 响应，重建文件响应头白名单
+- PDF 强制附件下载；GIF 保留真实文件名与类型
+- 修正文档：旧域名数据跨域切换前须迁移；明确删除索引不会删除 Telegram 原始文件
 
 #### v2.2.0
 - 管理页改为**游标分页**（`WHERE url < ?`），修复 `OFFSET` 深翻页扫描近百万行的问题
@@ -364,11 +371,11 @@ SELECT COUNT(*) FROM media;
 ## 从上游升级
 
 1. 用本仓库的 `_worker.js` 整份替换
-2. 环境变量无需任何改动
+2. 配置强 `USERNAME` / `PASSWORD`；`ENABLE_AUTH` 不再生效，只有 `DISABLE_AUTH=true` 才关闭首页与上传认证
 3. **Purge Everything** 清一次缓存（首页 HTML 缓存 3600 秒，不清可能看不到新版本号）
 4. 老链接随便点几条验证，应照常打开
 
-数据库表结构与上游完全一致，旧数据可直接沿用，无需迁移。
+数据库表结构与上游完全一致，但如果旧记录的完整 URL 使用的主机名不同于当前 `DOMAIN`，必须先执行上方的 D1 迁移步骤。升级前请确认已配置强 `USERNAME` / `PASSWORD`；默认情况下首页与上传接口将要求认证。
 
 ---
 
